@@ -8,6 +8,8 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 WIFI_SSID="${WIFI_SSID:-}"
 WIFI_PSK="${WIFI_PSK:-}"
 
@@ -75,14 +77,23 @@ mkdir -p /etc/initramfs-tools/scripts/init-bottom
 mkdir -p /etc/dropbear-initramfs /etc/dropbear/initramfs /root/.ssh /etc/nadamu/wifi
 
 # Copy local unlock helper
-cp bin/unlock /usr/local/bin/unlock
+cp "${SCRIPT_DIR}/bin/unlock" /usr/local/bin/unlock
 chmod 755 /usr/local/bin/unlock
 
 # 4. Optional Wi-Fi Hotspot / AP configuration (Mode A3 / A4)
+WIFI_CONF="/etc/nadamu/wifi/wpa_supplicant.conf"
 if [ -z "$WIFI_SSID" ] && [ -t 0 ]; then
     echo ""
-    printf "Configure Wi-Fi Hotspot for wireless unlock (Mode A3)? [y/N]: "
-    read -r configure_wifi || configure_wifi="n"
+    if [ -f "$WIFI_CONF" ]; then
+        EXISTING_SSID=$(grep -E '^\s*ssid=' "$WIFI_CONF" 2>/dev/null | head -n1 | cut -d'"' -f2)
+        echo "[i] Existing Wi-Fi configuration detected (SSID: \"${EXISTING_SSID:-unknown}\")."
+        printf "Reconfigure / overwrite Wi-Fi settings? [y/N]: "
+        read -r configure_wifi || configure_wifi="n"
+    else
+        printf "Configure Wi-Fi Hotspot for wireless unlock (Mode A3)? [y/N]: "
+        read -r configure_wifi || configure_wifi="n"
+    fi
+
     if [ "$configure_wifi" = "y" ] || [ "$configure_wifi" = "Y" ]; then
         printf "Enter Phone Wi-Fi Hotspot SSID: "
         read -r WIFI_SSID
@@ -93,7 +104,7 @@ fi
 
 if [ -n "$WIFI_SSID" ] && [ -n "$WIFI_PSK" ]; then
     echo "[*] Writing Wi-Fi configuration for SSID: $WIFI_SSID..."
-    cat << EOF > /etc/nadamu/wifi/wpa_supplicant.conf
+    cat << EOF > "$WIFI_CONF"
 ctrl_interface=/run/wpa_supplicant
 update_config=1
 
@@ -103,8 +114,10 @@ network={
     key_mgmt=WPA-PSK
 }
 EOF
-    chmod 600 /etc/nadamu/wifi/wpa_supplicant.conf
-    echo "[+] Wi-Fi configuration saved (/etc/nadamu/wifi/wpa_supplicant.conf)."
+    chmod 600 "$WIFI_CONF"
+    echo "[+] Wi-Fi configuration saved ($WIFI_CONF)."
+elif [ -f "$WIFI_CONF" ]; then
+    echo "[*] Keeping existing Wi-Fi configuration ($WIFI_CONF)."
 fi
 
 # 5. Create initramfs hook for LUKS passfifo and helper
