@@ -5,7 +5,7 @@
 > Comprehensive step-by-step guide for setting up LUKS remote unlocking on Kali Linux / Debian / Ubuntu laptops.
 > Configures `dropbear-initramfs`, kernel modules, Wi-Fi hooks, and unlock parameters.
 >
-> Verified: 2026-08-28 (tested via lab test_unlock.py against multi-transport QEMU test harness)
+> Verified: 2026-10-20 (tested via lab test_unlock.py and verified on physical hardware with init-bottom cleanup)
 
 ---
 
@@ -226,7 +226,7 @@ sudo chmod +x /etc/initramfs-tools/hooks/nadamu_wifi
 ```
 
 #### Step 4. Create Initramfs Premount Script (`nadamu_wifi_up`)
-This script runs asynchronously at `init-premount` time: it instantly yields control to the boot process so the LUKS prompt appears with zero delay, while connecting to the hotspot and obtaining a DHCP lease in the background:
+This script runs asynchronously at `init-premount` time: it instantly yields control to the boot process so the LUKS prompt appears with zero delay, while continuously checking for Wi-Fi association and obtaining a DHCP lease in the background. It records its PID and self-terminates as soon as the LUKS volume is unlocked:
 ```sh
 sudo tee /etc/initramfs-tools/scripts/init-premount/nadamu_wifi_up > /dev/null << 'EOF'
 #!/bin/sh
@@ -249,22 +249,54 @@ bg_wifi_connect() {
         fi
     done
 
+    if [ -z "$WLAN_IF" ]; then
+        for ifname in wlan0 wlan1 wlp2s0 wlp3s0 wlo1; do
+            if [ -d "/sys/class/net/$ifname" ]; then
+                WLAN_IF="$ifname"
+                break
+            fi
+        done
+    fi
+
+    [ -n "$WLAN_IF" ] || exit 0
+
     ip link set "$WLAN_IF" up 2>/dev/null || true
     mkdir -p /run /var/run /run/wpa_supplicant
 
-    wpa_supplicant -B -i "$WLAN_IF" -Dnl80211,wext -c "$CONF" -P /run/wpa_supplicant.pid 2>/dev/null || true
+    if ! pgrep wpa_supplicant >/dev/null 2>&1 && [ ! -f /run/wpa_supplicant.pid ]; then
+        wpa_supplicant -B -i "$WLAN_IF" -Dnl80211,wext -c "$CONF" -P /run/wpa_supplicant.pid 2>/dev/null || \
+        wpa_supplicant -B -i "$WLAN_IF" -c "$CONF" -P /run/wpa_supplicant.pid 2>/dev/null || true
+    fi
 
-    for i in $(seq 1 20); do
-        if iw dev "$WLAN_IF" link 2>/dev/null | grep -q "Connected to"; then
-            udhcpc -i "$WLAN_IF" -n -q -t 5 2>/dev/null || true
-            break
+    while true; do
+        # 1. Exit immediately if LUKS volume is opened
+        if ls /dev/mapper 2>/dev/null | grep -qv "^control$"; then
+            exit 0
         fi
-        sleep 1
+
+        # 2. Check association status
+        IS_CONNECTED=0
+        if command -v iw >/dev/null 2>&1; then
+            iw dev "$WLAN_IF" link 2>/dev/null | grep -q "Connected to" && IS_CONNECTED=1
+        fi
+        if [ "$IS_CONNECTED" -eq 0 ] && [ -f "/sys/class/net/$WLAN_IF/carrier" ]; then
+            [ "$(cat "/sys/class/net/$WLAN_IF/carrier" 2>/dev/null)" = "1" ] && IS_CONNECTED=1
+        fi
+
+        if [ "$IS_CONNECTED" -eq 1 ]; then
+            HAS_IP=$(ip -4 addr show dev "$WLAN_IF" 2>/dev/null | grep "inet ")
+            if [ -z "$HAS_IP" ]; then
+                udhcpc -i "$WLAN_IF" -n -q -t 5 2>/dev/null || true
+            fi
+        fi
+
+        sleep 2
     done
 }
 
-# Run in background for instantaneous LUKS prompt display
+# Run in background for instantaneous LUKS prompt display and record worker PID
 bg_wifi_connect >/dev/null 2>&1 &
+echo $! > /run/nadamu_wifi.pid
 exit 0
 EOF
 sudo chmod +x /etc/initramfs-tools/scripts/init-premount/nadamu_wifi_up
@@ -281,8 +313,46 @@ sudo chmod +x /etc/initramfs-tools/scripts/init-premount/nadamu_wifi_up
   - `-n`: Exit immediately if lease is not obtained (non-blocking).
   - `-q`: Quit immediately after obtaining a valid DHCP lease.
   - `-t 5`: Send up to 5 DHCP discover packets.
+- `echo $! > /run/nadamu_wifi.pid`: Tracks background shell worker PID for clean termination.
 
-#### Step 5. Rebuild Initramfs
+#### Step 5. Create Init-Bottom Cleanup Script (`nadamu_cleanup`)
+Debian/Ubuntu `initramfs-tools` executes scripts in `init-bottom` immediately after the root volume is unlocked and before switching root into the real OS (`switch_root`). This ensures Dropbear, `wpa_supplicant`, `udhcpc`, and background connection workers are cleanly terminated so no orphaned processes leak into Kali Linux or consume CPU:
+```sh
+sudo mkdir -p /etc/initramfs-tools/scripts/init-bottom
+sudo tee /etc/initramfs-tools/scripts/init-bottom/nadamu_cleanup > /dev/null << 'EOF'
+#!/bin/sh
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0;; esac
+
+# 1. Terminate background Wi-Fi connection loop
+[ -f /run/nadamu_wifi.pid ] && kill -9 $(cat /run/nadamu_wifi.pid) 2>/dev/null || true
+killall -9 nadamu_wifi_up 2>/dev/null || true
+pkill -9 -f nadamu_wifi_up 2>/dev/null || true
+
+# 2. Terminate DHCP client and wpa_supplicant
+killall -9 udhcpc 2>/dev/null || true
+[ -f /run/wpa_supplicant.pid ] && kill -9 $(cat /run/wpa_supplicant.pid) 2>/dev/null || true
+killall -9 wpa_supplicant 2>/dev/null || true
+
+# 3. Terminate Dropbear SSH daemon before switch_root
+[ -f /run/dropbear.pid ] && kill -9 $(cat /run/dropbear.pid) 2>/dev/null || true
+killall -9 dropbear 2>/dev/null || true
+pkill -9 -f dropbear 2>/dev/null || true
+
+# 4. Release wireless interface for NetworkManager
+for ifpath in /sys/class/net/*; do
+    if [ -d "$ifpath/wireless" ] || [ -d "$ifpath/phy80211" ]; then
+        ip link set "$(basename "$ifpath")" down 2>/dev/null || true
+    fi
+done
+
+exit 0
+EOF
+sudo chmod +x /etc/initramfs-tools/scripts/init-bottom/nadamu_cleanup
+```
+
+#### Step 6. Rebuild Initramfs
 ```sh
 sudo update-initramfs -u -k all
 ```

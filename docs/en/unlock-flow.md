@@ -7,7 +7,7 @@
 > initrd by the lab or installer). If you change anything here, you are
 > changing BOTH sides — update this file in the same commit.
 >
-> Verified: 2026-09-29 (contract verified by lab test_unlock.py suite, Android TOFU host key pinning, structured logging, adaptive mapper polling, channel IP caching, strict trusted host filtering, and mandatory unlock confirmation)
+> Verified: 2026-10-20 (contract verified by lab test_unlock.py suite, Android TOFU host key pinning, structured logging, adaptive mapper polling, init-bottom daemon cleanup, channel IP caching, strict trusted host filtering, and mandatory unlock confirmation)
 
 ## TL;DR
 
@@ -65,9 +65,10 @@ MAPPERS=$(ls /dev/mapper 2>/dev/null | grep -v "^control$")
 
 ## Handoff semantics (pivot to real system)
 
-When the volume opens, the initramfs continues boot and the SSH session /
-tunnels die. Clients MUST treat "connection dropped + mapper device was
-present" as SUCCESS (handoff), not as an error.
+When the volume opens, the initramfs executes `init-bottom` cleanup hooks (`nadamu_cleanup`)
+which cleanly terminate Dropbear, `wpa_supplicant`, `udhcpc`, and background Wi-Fi connection
+workers before `switch_root`. The SSH session and tunnels terminate immediately upon mapper opening.
+Clients MUST treat "connection dropped + mapper device was present" as SUCCESS (handoff), not as an error.
 
 ## Known deviations (bugs)
 
